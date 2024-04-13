@@ -14,7 +14,7 @@ const port = process.env.PORT || 4000;
 const jwtToken = process.env.JWT_TOKEN;
 
 // Database Connection With Mongo DB
-mongoose.connect("mongodb+srv://bahattin:99Bvq1Vv2V2so4CF@cluster0.cpbxvk9.mongodb.net/e-commerce");
+mongoose.connect(process.env.MONGO_CONNECT);
 
 // api creation
 
