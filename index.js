@@ -12,6 +12,7 @@ app.use(cors());
 
 const port = process.env.PORT || 4000;
 const jwtToken = process.env.JWT_TOKEN;
+const host = process.env.HOST || "http://localhost";
 
 // Database Connection With Mongo DB
 mongoose.connect(process.env.MONGO_CONNECT);
@@ -39,7 +40,7 @@ app.use("/images", express.static("upload/images"));
 app.post("/upload", upload.single("product"), (req, res) => {
   res.json({
     success: 1,
-    image_url: `http://localhost:${port}/images/${req.file.filename}`,
+    image_url: `${host}:${port}/images/${req.file.filename}`,
   });
 });
 
