@@ -46,6 +46,7 @@ app.post("/upload", upload.single("product"), (req, res) => {
 //#region  Middleware
 const fetchUser = async (req, res, next) => {
   const token = req.header("auth-token");
+
   if (!token) {
     res.status(401), send({ errors: "Please authenticate using valid token!" });
   } else {
@@ -170,9 +171,12 @@ app.post("/removeFromCart", fetchUser, async (req, res) => {
 
 app.post("/getCart", fetchUser, async (req, res) => {
   const { id } = req.user;
-  let userData = await Users.findOne({ _id: id });
-
-  res.status(200).json(userData.cartData);
+  if (id == null) {
+    res.status(200).json([]);
+  } else {
+    let userData = await Users.findOne({ _id: id });
+    res.status(200).json(userData.cartData);
+  }
 
   console.log("Get Cart");
 });
