@@ -24,7 +24,6 @@ app.get("/", (req, res) => {
 });
 
 // image storage engine
-
 const storage = multer.diskStorage({
   destination: "./upload/images",
   filename: (req, file, cb) => {
@@ -44,6 +43,7 @@ app.post("/upload", upload.single("product"), (req, res) => {
   });
 });
 
+//#region  Middleware
 const fetchUser = async (req, res, next) => {
   const token = req.header("auth-token");
   if (!token) {
@@ -59,6 +59,7 @@ const fetchUser = async (req, res, next) => {
     }
   }
 };
+//#endregion
 
 //#region  Schemas
 
@@ -140,6 +141,9 @@ app.get("/popularInWomen", async (req, res) => {
   res.status(200).json(newCollection);
 });
 
+//#endregion
+
+//#region Cart Functions
 app.post("/addToCart", fetchUser, async (req, res) => {
   const { id } = req.user;
   const { itemId } = req.body;
