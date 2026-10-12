@@ -28,6 +28,19 @@ const Users =
     date: { type: Date, default: Date.now },
   });
 
+const RefreshToken =
+  mongoose.models.RefreshToken ||
+  mongoose.model(
+    "RefreshToken",
+    {
+      userId: { type: mongoose.Schema.Types.ObjectId, ref: "Users", required: true },
+      // The raw token lives only in the httpOnly cookie; the DB stores a hash.
+      tokenHash: { type: String, required: true, unique: true },
+      expiresAt: { type: Date, required: true },
+      createdAt: { type: Date, default: Date.now },
+    }
+  );
+
 const CART_SIZE = 301; // index 0..300, matches the frontend default cart
 
 const createEmptyCart = () => {
@@ -38,4 +51,4 @@ const createEmptyCart = () => {
   return cart;
 };
 
-module.exports = { Product, Users, createEmptyCart, CART_SIZE };
+module.exports = { Product, Users, RefreshToken, createEmptyCart, CART_SIZE };

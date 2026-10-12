@@ -9,7 +9,8 @@ const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
 const cookieParser = require("cookie-parser");
-const { Product, Users, createEmptyCart } = require("./models");
+const crypto = require("crypto");
+const { Product, Users, RefreshToken, createEmptyCart } = require("./models");
 require("dotenv").config();
 
 const app = express();
@@ -24,11 +25,14 @@ const allowedOrigins = (process.env.CORS_ORIGINS || "http://localhost:3000,http:
 // Auth is carried in an httpOnly cookie instead of localStorage: an XSS in the
 // SPA cannot read the token. SameSite=strict stops a third-party page from
 // making the browser send it (CSRF); Secure is enabled behind HTTPS.
+// SameSite=strict is the safest default while the SPA and the API are on the
+// same site. If the SPA is served from a *different* domain in production the
+// browser will not send the cookie at all: set COOKIE_SAMESITE=none together
+// with COOKIE_SECURE=true (Secure is mandatory for SameSite=None).
 const cookieOptions = {
   httpOnly: true,
-  sameSite: "strict",
+  sameSite: process.env.COOKIE_SAMESITE || "strict",
   secure: process.env.COOKIE_SECURE === "true",
-  maxAge: 7 * 24 * 60 * 60 * 1000,
 };
 
 // helmet: CSP, nosniff, X-Frame-Options, referrer policy, etc.
@@ -83,7 +87,10 @@ const port = process.env.PORT || 4000;
 const host = process.env.HOST || "http://localhost";
 const mongoUri = process.env.MONGO_CONNECT;
 const jwtToken = process.env.JWT_TOKEN;
-const tokenExpiry = process.env.JWT_EXPIRES_IN || "7d";
+// The access token is short-lived; a separate httpOnly refresh cookie renews it
+// so a stolen/leaked access token has a small window of usefulness.
+const accessExpiresSec = Math.max(60, Number(process.env.JWT_ACCESS_EXPIRES_SEC || 900));
+const refreshExpiresDays = Math.max(1, Number(process.env.REFRESH_TOKEN_DAYS || 7));
 
 // Fail fast with a readable message instead of crashing later with a cryptic error.
 if (!mongoUri) {
@@ -96,7 +103,10 @@ if (!jwtToken) {
 }
 
 // Absolute path: multer/express.static must not depend on the process CWD.
+// Runtime uploads are gitignored; the demo images shipped with the repo live in
+// seed/images so user uploads never end up in git.
 const uploadDir = path.join(__dirname, "upload", "images");
+const seedDir = path.join(__dirname, "seed", "images");
 fs.mkdirSync(uploadDir, { recursive: true });
 
 // Wraps async route handlers so rejected promises reach the error middleware
@@ -107,6 +117,30 @@ const BCRYPT_ROUNDS = 10;
 // $2a$ / $2b$ / $2y$ prefixes are bcrypt hashes; anything else is a legacy
 // plaintext password written before hashing was introduced.
 const isBcryptHash = (value) => typeof value === "string" && /^\$2[aby]\$\d{2}\$/.test(value);
+
+const sha256 = (value) => crypto.createHash("sha256").update(value).digest("hex");
+
+// Issues a short-lived access cookie plus a longer-lived single-use refresh
+// cookie. Refresh tokens are stored hashed: a leaked DB row is not a usable
+// token.
+async function issueSession(res, userId) {
+  const access = jwt.sign({ user: { id: userId } }, jwtToken, { expiresIn: accessExpiresSec });
+  const refresh = crypto.randomBytes(32).toString("hex");
+
+  await RefreshToken.deleteMany({ expiresAt: { $lt: new Date() } });
+  await RefreshToken.create({
+    userId,
+    tokenHash: sha256(refresh),
+    expiresAt: new Date(Date.now() + refreshExpiresDays * 24 * 60 * 60 * 1000),
+  });
+
+  res.cookie("auth_token", access, { ...cookieOptions, maxAge: accessExpiresSec * 1000 });
+  res.cookie("refresh_token", refresh, {
+    ...cookieOptions,
+    maxAge: refreshExpiresDays * 24 * 60 * 60 * 1000,
+    path: "/refresh",
+  });
+}
 
 // Database connection with MongoDB
 mongoose
@@ -131,6 +165,11 @@ const fetchUser = (req, res, next) => {
     req.user = data.user;
     next();
   } catch (error) {
+    // "session_expired" lets the SPA hit /refresh instead of dumping the user
+    // back on the login screen.
+    if (error.name === "TokenExpiredError") {
+      return res.status(401).json({ success: false, errors: "Session expired", code: "session_expired" });
+    }
     return res.status(401).json({ success: false, errors: "Token is not valid!" });
   }
 };
@@ -191,6 +230,7 @@ const upload = multer({
 
 // creating upload endpoint for images
 app.use("/images", express.static(uploadDir));
+app.use("/images", express.static(seedDir));
 
 app.post(
   "/upload",
@@ -228,10 +268,39 @@ app.get(
   })
 );
 
-app.post("/logout", (req, res) => {
-  res.clearCookie("auth_token", { path: "/" });
-  res.json({ success: true });
-});
+app.post(
+  "/refresh",
+  authLimiter,
+  asyncHandler(async (req, res) => {
+    const refresh = req.cookies?.refresh_token;
+    if (!refresh) {
+      return res.status(401).json({ success: false, errors: "No refresh token" });
+    }
+
+    const stored = await RefreshToken.findOne({ tokenHash: sha256(refresh) });
+    if (!stored || stored.expiresAt < new Date()) {
+      return res.status(401).json({ success: false, errors: "Refresh token is not valid" });
+    }
+
+    // Rotation: the presented refresh token is single-use.
+    await RefreshToken.deleteOne({ _id: stored._id });
+    await issueSession(res, stored.userId);
+    res.json({ success: true });
+  })
+);
+
+app.post(
+  "/logout",
+  asyncHandler(async (req, res) => {
+    const refresh = req.cookies?.refresh_token;
+    if (refresh) {
+      await RefreshToken.deleteOne({ tokenHash: sha256(refresh) });
+    }
+    res.clearCookie("auth_token", { path: "/" });
+    res.clearCookie("refresh_token", { path: "/refresh" });
+    res.json({ success: true });
+  })
+);
 
 app.post(
   "/addProduct",
@@ -286,11 +355,23 @@ app.post(
   })
 );
 
-// Creating api for getting all products
+// Optional pagination: ?page=2&limit=50. Without query params the whole list is
+// returned, so existing SPA code keeps working unchanged.
 app.get(
   "/allProducts",
   asyncHandler(async (req, res) => {
-    const products = await Product.find({});
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const requestedLimit = Number(req.query.limit) || 0;
+
+    if (!requestedLimit) {
+      return res.json(await Product.find({}));
+    }
+
+    const limit = Math.min(100, Math.max(1, requestedLimit));
+    const total = await Product.countDocuments();
+    const products = await Product.find({}).sort({ id: 1 }).skip((page - 1) * limit).limit(limit);
+
+    res.set("X-Total-Count", String(total));
     res.json(products);
   })
 );
@@ -412,9 +493,7 @@ app.post(
 
     await user.save();
 
-    const data = { user: { id: user.id } };
-    const token = jwt.sign(data, jwtToken, { expiresIn: tokenExpiry });
-    res.cookie("auth_token", token, cookieOptions);
+    await issueSession(res, user.id);
     res.status(200).json({ success: true, name: user.name });
   })
 );
@@ -455,9 +534,7 @@ app.post(
       return res.status(401).json({ success: false, errors: "Invalid email or password." });
     }
 
-    const data = { user: { id: user.id } };
-    const token = jwt.sign(data, jwtToken, { expiresIn: tokenExpiry });
-    res.cookie("auth_token", token, cookieOptions);
+    await issueSession(res, user.id);
     res.json({ success: true, name: user.name });
   })
 );
@@ -490,6 +567,8 @@ app.use((error, req, res, next) => {
 const server = app.listen(port, () => {
   console.log("Server Running on Port " + port);
 });
+
+module.exports = { app, server };
 
 server.on("error", (error) => {
   console.error("Server error:", error.message);
