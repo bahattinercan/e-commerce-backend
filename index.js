@@ -7,6 +7,8 @@ const path = require("path");
 const fs = require("fs");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
+const helmet = require("helmet");
+const cookieParser = require("cookie-parser");
 const { Product, Users, createEmptyCart } = require("./models");
 require("dotenv").config();
 
@@ -19,7 +21,33 @@ const allowedOrigins = (process.env.CORS_ORIGINS || "http://localhost:3000,http:
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+// Auth is carried in an httpOnly cookie instead of localStorage: an XSS in the
+// SPA cannot read the token. SameSite=strict stops a third-party page from
+// making the browser send it (CSRF); Secure is enabled behind HTTPS.
+const cookieOptions = {
+  httpOnly: true,
+  sameSite: "strict",
+  secure: process.env.COOKIE_SECURE === "true",
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+};
+
+// helmet: CSP, nosniff, X-Frame-Options, referrer policy, etc.
+// crossOriginResourcePolicy must stay permissive: the storefront loads product
+// images served by this API from a different dev port.
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        imgSrc: ["'self'", "data:"],
+        objectSrc: ["'none'"],
+      },
+    },
+  })
+);
 app.use(express.json({ limit: "100kb" }));
+app.use(cookieParser());
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -31,6 +59,7 @@ app.use(
       error.status = 403;
       return callback(error);
     },
+    credentials: true,
   })
 );
 
@@ -90,7 +119,8 @@ mongoose
 
 //#region  Middleware
 const fetchUser = (req, res, next) => {
-  const token = req.header("auth-token");
+  // Cookie is the primary channel; the header stays for non-browser clients.
+  const token = req.cookies?.auth_token || req.header("auth-token");
 
   if (!token) {
     return res.status(401).json({ success: false, errors: "Please authenticate using valid token!" });
@@ -182,6 +212,25 @@ app.post(
 
 app.get("/adminVerify", fetchUser, requireAdmin, (req, res) => {
   res.json({ success: true, name: req.adminUser.name, email: req.adminUser.email });
+});
+
+// Session probe: the SPA decides whether it is logged in without ever touching
+// the token itself.
+app.get(
+  "/me",
+  fetchUser,
+  asyncHandler(async (req, res) => {
+    const user = await Users.findById(req.user.id).select("name email role");
+    if (!user) {
+      return res.status(404).json({ success: false, errors: "User not found" });
+    }
+    res.json({ success: true, name: user.name, email: user.email, role: user.role });
+  })
+);
+
+app.post("/logout", (req, res) => {
+  res.clearCookie("auth_token", { path: "/" });
+  res.json({ success: true });
 });
 
 app.post(
@@ -365,7 +414,8 @@ app.post(
 
     const data = { user: { id: user.id } };
     const token = jwt.sign(data, jwtToken, { expiresIn: tokenExpiry });
-    res.status(200).json({ success: true, token });
+    res.cookie("auth_token", token, cookieOptions);
+    res.status(200).json({ success: true, name: user.name });
   })
 );
 
@@ -407,7 +457,8 @@ app.post(
 
     const data = { user: { id: user.id } };
     const token = jwt.sign(data, jwtToken, { expiresIn: tokenExpiry });
-    res.json({ success: true, token });
+    res.cookie("auth_token", token, cookieOptions);
+    res.json({ success: true, name: user.name });
   })
 );
 //#endregion
