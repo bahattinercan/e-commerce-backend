@@ -5,6 +5,7 @@
 // real database.
 
 const path = require("path");
+const fs = require("node:fs");
 const assert = require("node:assert");
 const { test } = require("node:test");
 const { MongoMemoryServer } = require("mongodb-memory-server");
@@ -225,6 +226,70 @@ test("uploads must be real images", async () => {
 
   const response = await fetch(BASE + "/upload", { method: "POST", body: form, headers: { cookie: cookieHeader(jar) } });
   assert.strictEqual(response.status, 400);
+});
+
+// The declared part Content-Type is client-supplied, so a part can claim
+// image/png while its bytes are HTML. The sniff check has to catch that.
+test("a part that declares image/png but contains HTML is rejected", async () => {
+  const { jar } = await login("admin@test.com", "admin123");
+
+  const form = new FormData();
+  form.append("product", new Blob(["<script>alert(1)</script>"], { type: "image/png" }), "evil.png");
+
+  const response = await fetch(BASE + "/upload", { method: "POST", body: form, headers: { cookie: cookieHeader(jar) } });
+  assert.strictEqual(response.status, 400);
+  const body = await response.json();
+  assert.match(body.error, /signature/, "rejected by the signature check, not the declared mimetype");
+});
+
+test("a real PNG is accepted and stored with the sniffed extension", async () => {
+  const { jar } = await login("admin@test.com", "admin123");
+
+  // Smallest payload that carries a real PNG signature.
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
+    "base64"
+  );
+
+  const form = new FormData();
+  form.append("product", new Blob([png], { type: "image/png" }), "pixel.png");
+
+  const response = await fetch(BASE + "/upload", { method: "POST", body: form, headers: { cookie: cookieHeader(jar) } });
+  assert.strictEqual(response.status, 200);
+  const body = await response.json();
+  const filename = body.image_url.split("/").pop();
+  assert.ok(filename.endsWith(".png"), `sniffed extension, got ${filename}`);
+
+  const stored = fs.readFileSync(path.join(__dirname, "..", "upload", "images", filename));
+  assert.ok(stored.equals(png), "the accepted file was written intact");
+  fs.unlinkSync(path.join(__dirname, "..", "upload", "images", filename));
+});
+
+// multer 2.3.0 moved the boundary: a file of exactly limits.fileSize is now
+// accepted, 1.x rejected it. Pinning the behaviour so a future bump cannot
+// silently change the cap again.
+test("fileSize boundary: exactly 5 MB accepted, 5 MB + 1 rejected", async () => {
+  const { jar } = await login("admin@test.com", "admin123");
+  const uploadDir = path.join(__dirname, "..", "upload", "images");
+  const signature = Buffer.from("89504e470d0a1a0a", "hex");
+
+  const upload = (size) => {
+    const form = new FormData();
+    const bytes = Buffer.concat([signature, Buffer.alloc(size - signature.length)]);
+    form.append("product", new Blob([bytes], { type: "image/png" }), "big.png");
+    return fetch(BASE + "/upload", { method: "POST", body: form, headers: { cookie: cookieHeader(jar) } });
+  };
+
+  const exact = await upload(5 * 1024 * 1024);
+  assert.strictEqual(exact.status, 200, "exactly limits.fileSize is accepted");
+  const exactName = (await exact.json()).image_url.split("/").pop();
+  fs.unlinkSync(path.join(uploadDir, exactName));
+
+  const before = fs.readdirSync(uploadDir);
+  const over = await upload(5 * 1024 * 1024 + 1);
+  assert.strictEqual(over.status, 400);
+  assert.match((await over.json()).error, /too large/i, "LIMIT_FILE_SIZE reaches the JSON error handler");
+  assert.deepStrictEqual(fs.readdirSync(uploadDir), before, "over-limit upload writes nothing to disk");
 });
 
 test("helmet security headers are present", async () => {

@@ -10,6 +10,7 @@ const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
 const cookieParser = require("cookie-parser");
 const crypto = require("crypto");
+const { pipeline } = require("node:stream");
 const { Product, Users, RefreshToken, createEmptyCart } = require("./models");
 require("dotenv").config();
 
@@ -198,8 +199,11 @@ app.get("/", (req, res) => {
 });
 
 // image storage engine
-// Extension comes from the verified mimetype, never from the client-supplied
-// originalname (an attacker can name a file "payload.html.png").
+// fileFilter only sees the mimetype the client declares in the part header; the
+// bytes can be anything. A part claiming image/png that contains HTML would be
+// stored as .png and served from /images. So the extension comes from the
+// sniffed signature, never from mimetype or the client-supplied originalname
+// (an attacker can name a file "payload.html.png").
 const ALLOWED_IMAGE_TYPES = {
   "image/jpeg": ".jpg",
   "image/png": ".png",
@@ -207,13 +211,136 @@ const ALLOWED_IMAGE_TYPES = {
   "image/gif": ".gif",
 };
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const extension = ALLOWED_IMAGE_TYPES[file.mimetype] || ".bin";
-    return cb(null, `${file.fieldname}_${Date.now()}${extension}`);
+const PNG_SIGNATURE = Buffer.from("89504e470d0a1a0a", "hex");
+
+const IMAGE_SIGNATURES = [
+  {
+    type: "image/jpeg",
+    ext: ".jpg",
+    match: (b) => b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff,
   },
-});
+  {
+    type: "image/png",
+    ext: ".png",
+    match: (b) => b.length >= 8 && b.subarray(0, 8).equals(PNG_SIGNATURE),
+  },
+  {
+    type: "image/gif",
+    ext: ".gif",
+    match: (b) => b.length >= 6 && ["GIF87a", "GIF89a"].includes(b.subarray(0, 6).toString("latin1")),
+  },
+  {
+    type: "image/webp",
+    ext: ".webp",
+    match: (b) =>
+      b.length >= 12 &&
+      b.subarray(0, 4).toString("latin1") === "RIFF" &&
+      b.subarray(8, 12).toString("latin1") === "WEBP",
+  },
+];
+
+// Longest signature: WebP needs RIFF + size + WEBP, so 12 bytes are enough.
+const SNIFF_BYTES = 12;
+const sniffImage = (buffer) => IMAGE_SIGNATURES.find((s) => s.match(buffer)) || null;
+
+// Custom engine instead of diskStorage: diskStorage names and opens the file
+// before any byte arrives, so it cannot look at the content. Here the first
+// bytes are verified before anything is written, so a rejected part never
+// reaches the disk.
+// Write streams still open for a file, so _removeFile can wait for the
+// descriptor to close before unlinking (Windows refuses to unlink open files).
+const openStreams = new WeakMap();
+
+const storage = {
+  _handleFile(req, file, cb) {
+    let settled = false;
+    let flushed = false;
+    const finish = (error, info) => {
+      if (settled) return;
+      settled = true;
+      cb(error, info);
+    };
+
+    const reject = () => {
+      const error = new Error("File content does not match an allowed image signature");
+      error.status = 400;
+      file.stream.destroy();
+      return finish(error);
+    };
+
+    const head = [];
+    let headSize = 0;
+
+    const write = (signature) => {
+      if (flushed) return;
+      flushed = true;
+
+      const filename = `${file.fieldname}_${Date.now()}${signature.ext}`;
+      const filepath = path.join(uploadDir, filename);
+      const out = fs.createWriteStream(filepath);
+      const info = () => ({ destination: uploadDir, filename, path: filepath, size: out.bytesWritten });
+
+      file.path = filepath;
+      openStreams.set(file, out);
+      out.on("close", () => {
+        openStreams.delete(file);
+        if (!settled) finish(null, info());
+      });
+
+      out.write(Buffer.concat(head));
+
+      // A file smaller than the sniff window has already ended: nothing left to pipe.
+      if (file.stream.readableEnded || file.stream.destroyed) {
+        out.end();
+        return;
+      }
+
+      // pipeline ends the destination and reports source errors (busboy destroys
+      // the file stream when a limit is hit or the client aborts).
+      pipeline(file.stream, out, (error) => {
+        if (error) finish(error);
+      });
+    };
+
+    const onHead = (chunk) => {
+      head.push(chunk);
+      headSize += chunk.length;
+      if (headSize < SNIFF_BYTES) return;
+
+      file.stream.removeListener("data", onHead);
+      const signature = sniffImage(Buffer.concat(head));
+      if (!signature) return reject();
+      write(signature);
+    };
+
+    file.stream.on("data", onHead);
+    file.stream.on("end", () => {
+      // Only reached for files smaller than the sniff window; a flushed file
+      // must not be written a second time.
+      if (flushed || settled) return;
+      const signature = sniffImage(Buffer.concat(head));
+      if (!signature) return reject();
+      write(signature);
+    });
+    file.stream.on("error", finish);
+  },
+
+  _removeFile(req, file, cb) {
+    const filepath = file.path;
+    delete file.path;
+    if (!filepath) return cb();
+
+    const out = openStreams.get(file);
+    if (!out) return fs.unlink(filepath, (error) => cb(error));
+
+    // Abort can land while the write stream is still finishing; unlinking an
+    // open descriptor fails on Windows, so wait for close.
+    out.once("close", () => {
+      openStreams.delete(file);
+      fs.unlink(filepath, (error) => cb(error));
+    });
+  },
+};
 
 const upload = multer({
   storage: storage,
